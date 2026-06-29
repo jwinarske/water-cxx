@@ -20,8 +20,8 @@
 // (The fully-explicit acquire fence is the linux explicit-sync protocol;
 // implicit fencing via the foreign transfer is its idiomatic equivalent here.)
 //
-// This stage presents an animated clear colour to validate the path; the water
-// engine blits its scene into each slot on top of this next.
+// The water engine renders the scene on the same device; each frame is copied
+// into the acquired slot and handed to the compositor.
 
 #include "linux_dmabuf_client.hpp"
 #include "wayland_client.hpp"
@@ -57,6 +57,7 @@ extern "C" {
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -82,7 +83,7 @@ namespace {
 constexpr int kRoundtripTimeoutMs = 2000;
 constexpr int kNumBuffers = 3;  // N-slot ring; >2 gives release-gating headroom
 // DRM_FORMAT_ABGR8888 (LE bytes R,G,B,A) == VK_FORMAT_R8G8B8A8_UNORM, matching
-// the engine's scene colour format so the eventual blit needs no swizzle.
+// the engine's scene color format so the eventual blit needs no swizzle.
 constexpr uint32_t kDrmFormat = DRM_FORMAT_ABGR8888;
 constexpr VkFormat kVkFormat = VK_FORMAT_R8G8B8A8_UNORM;
 
@@ -150,6 +151,8 @@ class App {
  public:
   ~App();
   int Run();
+  int RunShot(
+      const char* path);  // headless: render a still to a PPM, no window
 
   void OnXdgSurfaceConfigure(uint32_t /*serial*/) { configured_ = true; }
   void OnToplevelConfigure(int32_t w, int32_t h) {
@@ -169,7 +172,7 @@ class App {
   bool CreatePresentRing();
   bool CreateWlBuffer(Slot& s, int index);
   bool InitEngine();    // the water renderer (sim, caustics, scene)
-  void RenderEngine();  // advance + render one frame into scene colour
+  void RenderEngine();  // advance + render one frame into scene color
   int Acquire();        // a free slot (released + GPU-retired), or -1
   void RenderFrame();
   void RequestFrameCallback();
@@ -690,7 +693,7 @@ void App::RenderFrame() {
 
   // Hand-off: copy the scene into the slot's dma-buf and release it to the
   // compositor — submitted without a CPU wait (the slot's fence + the FOREIGN
-  // ownership transfer carry the synchronisation).
+  // ownership transfer carry the synchronization).
   vkResetCommandBuffer(s.cmd, 0);
   const VkCommandBufferBeginInfo bi{
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -807,6 +810,40 @@ int App::Run() {
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
+// Headless still: render the scene off-screen (no compositor) and write it as a
+// binary PPM. Used to generate the README image and as a smoke test of the
+// engine path without a Wayland session.
+int App::RunShot(const char* path) {
+  auto dev = water::Device::create({});
+  if (!dev) {
+    std::fprintf(stderr, "water_window: Device::create failed: %s\n",
+                 dev.error().where.data());
+    return EXIT_FAILURE;
+  }
+  device_.emplace(std::move(*dev));
+  if (!InitEngine())
+    return EXIT_FAILURE;
+  // Warm the sim up (with periodic drops) so the surface is lively.
+  for (int i = 0; i < 320 && running_; ++i)
+    RenderEngine();
+  auto rgba = scene_->readback_color(*device_);
+  if (!rgba) {
+    std::fprintf(stderr, "water_window: readback failed\n");
+    return EXIT_FAILURE;
+  }
+  FILE* fp = std::fopen(path, "wb");
+  if (!fp) {
+    std::fprintf(stderr, "water_window: cannot open %s\n", path);
+    return EXIT_FAILURE;
+  }
+  std::fprintf(fp, "P6\n%d %d\n255\n", width_, height_);
+  for (std::size_t i = 0; i < std::size_t(width_) * height_; ++i)
+    std::fwrite(&(*rgba)[i * 4], 1, 3, fp);  // RGB, drop alpha
+  std::fclose(fp);
+  std::printf("water_window: wrote %s (%dx%d)\n", path, width_, height_);
+  return EXIT_SUCCESS;
+}
+
 void WlCallbackHandler::OnDone(uint32_t time_ms) {
   if (app_)
     app_->OnFrameReady(time_ms);
@@ -821,5 +858,7 @@ void WlBufferHandler::OnRelease() {
 
 int main() {
   App app;
+  if (const char* shot = std::getenv("WATER_SHOT"))
+    return app.RunShot(shot);
   return app.Run();
 }

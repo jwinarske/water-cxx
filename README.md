@@ -6,6 +6,13 @@ plugin: a native Vulkan producer that renders the water sim into a dma-buf-expor
 `VkImage`, composited by [drm-cxx](../drm-cxx) onto a KMS overlay plane, driven from
 Dart over `native_comms` (control only — no pixels cross the FFI boundary).
 
+![The water engine: ping-pong sim, ray-traced pool and ball, a reflective/refractive
+surface off a sky cubemap, and differential-area caustics — rendered on the Vulkan
+engine device and presented to a Wayland compositor via an exported dma-buf.](screenshots/water.png)
+
+> Rendered by the standalone Wayland demo (`-DWATER_BUILD_WAYLAND_DEMO=ON`,
+> `WATER_SHOT=water.png ./water_window` for the still).
+
 ## Status
 
 The Vulkan engine-slice renders the full demo headless: the ping-pong heightfield
