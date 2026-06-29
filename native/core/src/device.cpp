@@ -58,6 +58,24 @@ bool float32_filterable(VkPhysicalDevice phys) {
   return (fp.optimalTilingFeatures & need) == need;
 }
 
+// Physical-device preference (higher wins). Real GPUs beat a CPU (llvmpipe)
+// fallback, so multi-device boards (e.g. Pi 5: V3D + llvmpipe) never silently
+// land on software unless it is the only device offered.
+int type_rank(VkPhysicalDeviceType t) {
+  switch (t) {
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+      return 4;
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+      return 3;
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+      return 2;
+    case VK_PHYSICAL_DEVICE_TYPE_CPU:
+      return 0;  // last resort
+    default:
+      return 1;  // OTHER
+  }
+}
+
 }  // namespace
 
 Result<Device> Device::create(const DeviceConfig& cfg) {
@@ -107,9 +125,9 @@ Result<Device> Device::create(const DeviceConfig& cfg) {
         break;
       }
     } else if (!chosen ||
-               (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU &&
-                chosen_props.deviceType !=
-                    VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)) {
+               type_rank(p.deviceType) > type_rank(chosen_props.deviceType)) {
+      // Highest-ranked device wins; ties keep enumeration order. A CPU device
+      // is taken only when nothing better is present.
       chosen = pd;
       chosen_props = p;
     }
