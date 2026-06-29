@@ -214,9 +214,15 @@ class App {
 
   void OnXdgSurfaceConfigure(uint32_t /*serial*/) { configured_ = true; }
   void OnToplevelConfigure(int32_t w, int32_t h) {
-    if (w > 0 && h > 0) {
-      width_ = w;
+    if (w <= 0 || h <= 0)
+      return;  // compositor leaves the size to us
+    if (!live_) {
+      width_ = w;  // initial configure, before resources exist
       height_ = h;
+    } else if (w != width_ || h != height_) {
+      pending_w_ = w;  // a real resize; applied at the next frame
+      pending_h_ = h;
+      resize_pending_ = true;
     }
   }
   void OnToplevelClose() { running_ = false; }
@@ -236,7 +242,11 @@ class App {
   bool InitVulkan();
   bool CreatePresentRing();
   bool CreateWlBuffer(Slot& s, int index);
-  bool InitEngine();  // the water renderer (sim, caustics, scene)
+  bool InitEngine();            // the water renderer (sim, caustics, scene)
+  bool CreateSceneResources();  // size-dependent: scene pass, skybox, pipelines
+  void DestroySceneResources();
+  void DestroyPresentRing();
+  bool DoResize();  // apply a pending size change (recreate the size-dependent)
   void RecordEngine(VkCommandBuffer cmd);  // record one engine frame -> scene
   int Acquire();  // a free slot (released + GPU-retired), or -1
   void RenderFrame();
@@ -260,7 +270,10 @@ class App {
   bool configured_ = false;
   bool running_ = true;
   bool deferred_ = false;  // a frame was due but no slot was free
+  bool live_ = false;      // resources exist; configures are now resizes
+  bool resize_pending_ = false;
   int width_ = 1024, height_ = 768;
+  int pending_w_ = 0, pending_h_ = 0;
 
   std::optional<water::Device> device_;
   PFN_vkGetMemoryFdKHR get_memory_fd_ = nullptr;
@@ -593,8 +606,9 @@ bool App::CreatePresentRing() {
     if (!CreateWlBuffer(s, i))
       return false;
   }
-  std::printf("water_window: present ring ready (%d slots, %dx%d, stride=%u)\n",
-              kNumBuffers, width_, height_, slots_[0].stride);
+  if (!live_)  // quiet on resize (DoResize logs the new size)
+    std::printf("water_window: present ring (%d slots, %dx%d, stride=%u)\n",
+                kNumBuffers, width_, height_, slots_[0].stride);
   return true;
 }
 
@@ -683,6 +697,21 @@ bool App::InitEngine() {
   ENG_TRY(sphere_, upload_mesh(dev, make_sphere(32)));
   ENG_TRY(water_set_, caustics_->make_water_set(sim_->current().view, clamp_));
 
+  const glm::vec3 light = glm::normalize(glm::vec3(2.0f, 2.0f, -1.0f));
+  push_.light = glm::vec4(light, 0.0f);
+  if (!CreateSceneResources())
+    return false;
+  std::printf("water_window: engine ready (scene %dx%d)\n", width_, height_);
+  return true;
+}
+
+// The window-size-dependent render resources: the scene pass, the skybox built
+// against its render pass, the surface descriptor set, and the scene pipelines.
+// Created at startup and recreated on resize (sim / caustics / textures, which
+// are size-independent, are left alone).
+bool App::CreateSceneResources() {
+  using namespace water;
+  Device& dev = *device_;
   {
     auto r = ScenePass::create(dev, uint32_t(width_), uint32_t(height_));
     if (!r)
@@ -718,10 +747,6 @@ bool App::InitEngine() {
           P(std::span(water_vert_spv, water_vert_spv_count),
             std::span(water_below_frag_spv, water_below_frag_spv_count),
             VK_CULL_MODE_BACK_BIT));
-
-  const glm::vec3 light = glm::normalize(glm::vec3(2.0f, 2.0f, -1.0f));
-  push_.light = glm::vec4(light, 0.0f);
-  std::printf("water_window: engine ready (scene %dx%d)\n", width_, height_);
   return true;
 }
 
@@ -801,6 +826,10 @@ void App::RequestFrameCallback() {
 }
 
 void App::RenderFrame() {
+  if (resize_pending_ && !DoResize()) {
+    running_ = false;
+    return;
+  }
   const int slot = Acquire();
   if (slot < 0) {
     deferred_ = true;  // FrameEconomy: hold; wl_buffer.release will serve it
@@ -887,11 +916,53 @@ void App::OnBufferRelease(int slot) {
   }
 }
 
+void App::DestroyPresentRing() {
+  VkDevice dev = device_->handle();
+  for (auto& s : slots_) {
+    if (s.fence)
+      vkDestroyFence(dev, s.fence, nullptr);
+    if (s.cmd)
+      vkFreeCommandBuffers(dev, pool_, 1, &s.cmd);
+    if (s.image)
+      vkDestroyImage(dev, s.image, nullptr);
+    if (s.memory)
+      vkFreeMemory(dev, s.memory, nullptr);
+    if (s.dma_fd >= 0)
+      close(s.dma_fd);
+    s = Slot{};  // reset handles + lifecycle flags + the wl_buffer (destroyed)
+  }
+}
+
+void App::DestroySceneResources() {
+  skybox_.reset();  // its pipeline is built against the scene render pass
+  scene_.reset();   // owns the scene pipelines and the surface set's pool
+  pool_pipe_ = sphere_pipe_ = above_pipe_ = below_pipe_ = VK_NULL_HANDLE;
+  surf_ = VK_NULL_HANDLE;
+}
+
+// Apply a pending size change: recreate the size-dependent resources at the new
+// dimensions. Infrequent, so a device wait-idle here is fine.
+bool App::DoResize() {
+  resize_pending_ = false;
+  if (pending_w_ == width_ && pending_h_ == height_)
+    return true;
+  vkDeviceWaitIdle(device_->handle());
+  DestroyPresentRing();
+  DestroySceneResources();
+  width_ = pending_w_;
+  height_ = pending_h_;
+  if (!CreateSceneResources() || !CreatePresentRing())
+    return false;
+  std::printf("water_window: resized to %dx%d\n", width_, height_);
+  return true;
+}
+
 App::~App() {
   if (!device_)
     return;
   VkDevice dev = device_->handle();
   vkDeviceWaitIdle(dev);
+  DestroyPresentRing();
   // Engine objects without RAII handles (pipelines/sets are owned by the
   // passes; the passes themselves tear down as members before device_).
   water::destroy_mesh(*device_, plane_);
@@ -903,16 +974,6 @@ App::~App() {
     vkDestroySampler(dev, clamp_, nullptr);
   if (repeat_)
     vkDestroySampler(dev, repeat_, nullptr);
-  for (auto& s : slots_) {
-    if (s.fence)
-      vkDestroyFence(dev, s.fence, nullptr);
-    if (s.image)
-      vkDestroyImage(dev, s.image, nullptr);
-    if (s.memory)
-      vkFreeMemory(dev, s.memory, nullptr);
-    if (s.dma_fd >= 0)
-      close(s.dma_fd);
-  }
   if (pool_)
     vkDestroyCommandPool(dev, pool_, nullptr);
 }
@@ -924,6 +985,7 @@ int App::Run() {
   }
   if (!BindGlobals() || !CreateWindow() || !InitVulkan())
     return EXIT_FAILURE;
+  live_ = true;  // further xdg configures are now treated as resizes
 
   std::printf("water_window: presenting (close the window to quit)\n");
   RenderFrame();  // kickstart frame 0; subsequent frames driven by callbacks
