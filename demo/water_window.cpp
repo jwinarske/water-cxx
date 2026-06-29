@@ -236,9 +236,9 @@ class App {
   bool InitVulkan();
   bool CreatePresentRing();
   bool CreateWlBuffer(Slot& s, int index);
-  bool InitEngine();    // the water renderer (sim, caustics, scene)
-  void RenderEngine();  // advance + render one frame into scene color
-  int Acquire();        // a free slot (released + GPU-retired), or -1
+  bool InitEngine();  // the water renderer (sim, caustics, scene)
+  void RecordEngine(VkCommandBuffer cmd);  // record one engine frame -> scene
+  int Acquire();  // a free slot (released + GPU-retired), or -1
   void RenderFrame();
   void RequestFrameCallback();
 
@@ -322,6 +322,33 @@ void ImageBarrier(VkCommandBuffer cmd,
   };
   vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1,
                        &b);
+}
+
+// Global execution + memory dependency between two pipeline stages. Used
+// between the engine passes (which the single per-frame submit no longer
+// separates).
+void MemBarrier(VkCommandBuffer cmd,
+                VkPipelineStageFlags src_stage,
+                VkPipelineStageFlags dst_stage,
+                VkAccessFlags src_access,
+                VkAccessFlags dst_access) {
+  const VkMemoryBarrier mb{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                           .srcAccessMask = src_access,
+                           .dstAccessMask = dst_access};
+  vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 1, &mb, 0, nullptr, 0,
+                       nullptr);
+}
+
+// A conservative serialize-everything barrier. The engine render passes declare
+// no subpass->EXTERNAL dependency for an in-submit consumer (they were written
+// for isolated submits), so their finalLayout transitions aren't covered by
+// stage-scoped barriers; ALL_COMMANDS + MEMORY_WRITE/READ orders them
+// correctly. The engine stages are sequential anyway, so this costs no real
+// parallelism.
+void FullBarrier(VkCommandBuffer cmd) {
+  MemBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+             VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
 }
 
 // ── Wayland setup ────────────────────────────────────────────────────────────
@@ -701,11 +728,12 @@ bool App::InitEngine() {
 // Advance the sim and render one composited frame into scene_->color().
 // The engine's multi-pass stages keep the tested per-stage submit boundaries;
 // the present hand-off (below) is the zero-CPU-wait part.
-void App::RenderEngine() {
-  using namespace water;
-  Device& dev = *device_;
+// Record the whole engine frame (sim -> caustics -> scene) into one command
+// buffer. The passes used to be three CPU-synced submits; here explicit memory
+// barriers replace those submit boundaries, and a frame-start barrier
+// serializes the shared targets against the previous (now pipelined) frame.
+void App::RecordEngine(VkCommandBuffer cmd) {
   ++frame_;
-
   const glm::mat4 vp = cam_.view_projection(scene_->aspect());
   push_.vp = vp;
   push_.eye = glm::vec4(cam_.position(), 1.0f);
@@ -717,40 +745,37 @@ void App::RenderEngine() {
     pending_drops_.emplace_back(0.6f * std::sin(t * 1.3f),
                                 0.6f * std::cos(t * 0.7f));
 
-  // 1) sim: apply queued drops, then 2x step. Keeping the per-frame ping-pong
-  // swap count even leaves current() at the image our descriptors are baked to;
-  // an odd number of drops gets a zero-strength pad to preserve that.
-  if (!dev.submit_now([&](VkCommandBuffer cmd) {
-        for (const glm::vec2& d : pending_drops_)
-          sim_->add_drop(cmd, d, 0.04f, 0.5f);
-        if (pending_drops_.size() % 2 == 1)
-          sim_->add_drop(cmd, glm::vec2(0.0f), 0.01f, 0.0f);  // parity pad
-        pending_drops_.clear();
-        sim_->step(cmd);
-        sim_->step(cmd);
-      })) {
-    running_ = false;
-    return;
-  }
-  // 2) caustics from the light's POV.
-  if (!dev.submit_now([&](VkCommandBuffer cmd) {
-        caustics_->render(cmd, 0, push_, plane_, water_set_);
-      })) {
-    running_ = false;
-    return;
-  }
-  // 3) the composited scene -> scene_->color() (left TRANSFER_SRC_OPTIMAL).
-  if (!dev.submit_now([&](VkCommandBuffer cmd) {
-        scene_->begin(cmd, {0, 0, 0, 1});
-        skybox_->record(cmd, glm::inverse(vp), cam_.position());
-        scene_->draw(cmd, pool_pipe_, push_, pool_mesh_, surf_);
-        scene_->draw(cmd, above_pipe_, push_, plane_, surf_);
-        scene_->draw(cmd, below_pipe_, push_, plane_, surf_);
-        scene_->draw(cmd, sphere_pipe_, push_, sphere_, surf_);
-        scene_->end(cmd);
-      })) {
-    running_ = false;
-  }
+  // Order this frame's writes to the shared engine targets (heightfield,
+  // caustics, scene color) after the previous frame's reads of them. Without
+  // the old per-stage CPU waits, consecutive frames otherwise overlap on the
+  // queue.
+  FullBarrier(cmd);
+
+  // sim: queued drops (+ zero-strength parity pad so the per-frame ping-pong
+  // swap count stays even, keeping current() at the baked descriptor image),
+  // then 2x step.
+  for (const glm::vec2& d : pending_drops_)
+    sim_->add_drop(cmd, d, 0.04f, 0.5f);
+  if (pending_drops_.size() % 2 == 1)
+    sim_->add_drop(cmd, glm::vec2(0.0f), 0.01f, 0.0f);
+  pending_drops_.clear();
+  sim_->step(cmd);
+  sim_->step(cmd);
+
+  FullBarrier(cmd);  // heightfield writes -> caustics + scene sampling
+  caustics_->render(cmd, 0, push_, plane_, water_set_);
+  FullBarrier(cmd);  // caustics output -> scene fragment sampling
+
+  scene_->begin(cmd, {0, 0, 0, 1});
+  skybox_->record(cmd, glm::inverse(vp), cam_.position());
+  scene_->draw(cmd, pool_pipe_, push_, pool_mesh_, surf_);
+  scene_->draw(cmd, above_pipe_, push_, plane_, surf_);
+  scene_->draw(cmd, below_pipe_, push_, plane_, surf_);
+  scene_->draw(cmd, sphere_pipe_, push_, sphere_, surf_);
+  scene_->end(cmd);
+
+  FullBarrier(
+      cmd);  // scene color write -> transfer read (present copy/readback)
 }
 
 int App::Acquire() {
@@ -785,19 +810,16 @@ void App::RenderFrame() {
   VkDevice dev = device_->handle();
   const uint32_t mine = device_->queue_family();
 
-  // Render the water into scene_->color() (CPU-synced, tested per-stage path).
-  RenderEngine();
-  if (!running_)
-    return;
-
-  // Hand-off: copy the scene into the slot's dma-buf and release it to the
-  // compositor — submitted without a CPU wait (the slot's fence + the FOREIGN
+  // One command buffer per frame: the whole engine render, then the dma-buf
+  // hand-off — submitted once, with no CPU wait (the slot fence + the FOREIGN
   // ownership transfer carry the synchronization).
   vkResetCommandBuffer(s.cmd, 0);
   const VkCommandBufferBeginInfo bi{
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
   vkBeginCommandBuffer(s.cmd, &bi);
+
+  RecordEngine(s.cmd);  // sim + caustics + scene -> scene_->color()
 
   // Acquire the slot for writing. First use: from UNDEFINED. Reuse: reclaim
   // ownership from the compositor (FOREIGN) — the matching half of the release
@@ -815,8 +837,9 @@ void App::RenderFrame() {
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_QUEUE_FAMILY_FOREIGN_EXT, mine);
   }
-  // scene_->color() is already TRANSFER_SRC_OPTIMAL and fully written (the
-  // engine submits above CPU-waited), so a same-size copy needs no src barrier.
+  // scene_->color() is TRANSFER_SRC_OPTIMAL and made available to the transfer
+  // by RecordEngine's final barrier, so the same-size copy needs no src
+  // barrier.
   const VkImageCopy region{
       .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
       .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
@@ -922,9 +945,13 @@ int App::RunShot(const char* path) {
   device_.emplace(std::move(*dev));
   if (!InitEngine())
     return EXIT_FAILURE;
-  // Warm the sim up (with periodic drops) so the surface is lively.
+  // Warm the sim up (with periodic drops) so the surface is lively. Each frame
+  // is one recorded-and-waited submit here (no compositor to pace us).
   for (int i = 0; i < 320 && running_; ++i)
-    RenderEngine();
+    if (!device_->submit_now([&](VkCommandBuffer cmd) { RecordEngine(cmd); })) {
+      running_ = false;
+      break;
+    }
   auto rgba = scene_->readback_color(*device_);
   if (!rgba) {
     std::fprintf(stderr, "water_window: readback failed\n");
