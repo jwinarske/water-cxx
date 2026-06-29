@@ -18,7 +18,7 @@ jobs:
       WATER_VK_DEVICE: llvmpipe   # select lavapipe (the only device on the runner)
       WATER_SOAK_STEPS: "30000"   # NaN-soak length, trimmed for CPU rasterization
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # glslc (with #include support) + spirv-opt/spirv-val + the Vulkan loader and
       # validation layers come from the LunarG SDK; lavapipe is Mesa's CPU rasterizer.
