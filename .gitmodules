@@ -1,0 +1,3 @@
+[submodule "external/wayland-cxx-scanner"]
+	path = external/wayland-cxx-scanner
+	url = git@github.com:jwinarske/wayland-cxx-scanner.git

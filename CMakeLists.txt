@@ -17,6 +17,12 @@ list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 option(WATER_BUILD_SPIKES "Build the throwaway GPU spikes" ON)
 option(WATER_BUILD_NATIVE "Build the engine-slice + FFI surface" OFF)
+option(WATER_BUILD_WAYLAND_DEMO "Build the standalone Wayland windowed demo" OFF)
+
+# The Wayland demo links the engine-slice.
+if(WATER_BUILD_WAYLAND_DEMO)
+  set(WATER_BUILD_NATIVE ON)
+endif()
 
 enable_testing()
 
@@ -41,4 +47,8 @@ endif()
 if(WATER_BUILD_SPIKES)
   enable_testing()
   add_subdirectory(test/spikes)
+endif()
+
+if(WATER_BUILD_WAYLAND_DEMO)
+  add_subdirectory(demo)
 endif()

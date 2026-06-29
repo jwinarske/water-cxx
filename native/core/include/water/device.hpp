@@ -37,6 +37,7 @@ struct DeviceConfig {
   bool force_half =
       false;  // exercise the 16F path even where 32F is filterable
   bool enable_validation = false;  // VK_LAYER_KHRONOS_validation
+  bool dmabuf_export = false;  // enable exportable dma-buf memory (for present)
   std::string_view
       device_substr{};  // pick the physical device whose name contains this
 };

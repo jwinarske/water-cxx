@@ -151,10 +151,19 @@ Result<Device> Device::create(const DeviceConfig& cfg) {
       .queueCount = 1,
       .pQueuePriorities = &prio,
   };
+  // Optional dma-buf export (for presenting the rendered image to a Wayland
+  // compositor or KMS plane): exportable device memory as a dma-buf fd.
+  std::vector<const char*> dev_exts;
+  if (cfg.dmabuf_export) {
+    dev_exts.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+    dev_exts.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+  }
   const VkDeviceCreateInfo dci{
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
       .queueCreateInfoCount = 1,
       .pQueueCreateInfos = &qci,
+      .enabledExtensionCount = uint32_t(dev_exts.size()),
+      .ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data(),
   };
   WATER_CHECK(vkCreateDevice(d.phys_, &dci, nullptr, &d.device_),
               "vkCreateDevice");
