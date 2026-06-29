@@ -23,6 +23,7 @@
 // The water engine renders the scene on the same device; each frame is copied
 // into the acquired slot and handed to the compositor.
 
+#include "drm_syncobj_client.hpp"
 #include "linux_dmabuf_client.hpp"
 #include "wayland_client.hpp"
 #include "xdg_shell_client.hpp"
@@ -143,6 +144,19 @@ class LinuxBufferParamsHandler
     : public linux_dmabuf_unstable_v1::client::CZwpLinuxBufferParamsV1<
           LinuxBufferParamsHandler> {};
 
+// wp_linux_drm_syncobj_* — explicit-sync (request-only, no events). The acquire
+// timeline point (signaled by our GPU submit) is the compositor's acquire
+// fence; the release point (signaled by the compositor) gates slot reuse.
+class DrmSyncobjManagerHandler
+    : public linux_drm_syncobj_v1::client::CWpLinuxDrmSyncobjManagerV1<
+          DrmSyncobjManagerHandler> {};
+class DrmSyncobjTimelineHandler
+    : public linux_drm_syncobj_v1::client::CWpLinuxDrmSyncobjTimelineV1<
+          DrmSyncobjTimelineHandler> {};
+class DrmSyncobjSurfaceHandler
+    : public linux_drm_syncobj_v1::client::CWpLinuxDrmSyncobjSurfaceV1<
+          DrmSyncobjSurfaceHandler> {};
+
 // What a left-drag does, decided by what the press ray hit (main.js model).
 enum class Drag { None, Orbit, Ball, Drops };
 
@@ -200,9 +214,10 @@ struct Slot {
   uint64_t modifier = 0;
   wl::WlPtr<WlBufferHandler> wl_buffer;
   VkCommandBuffer cmd = VK_NULL_HANDLE;
-  VkFence fence = VK_NULL_HANDLE;  // signals when this slot's GPU work retires
-  bool held = false;               // attached, compositor not yet released it
-  bool initialized = false;        // has been rendered at least once
+  VkFence fence = VK_NULL_HANDLE;  // GPU-retired (implicit-sync path)
+  uint64_t release_pt = 0;   // explicit-sync: compositor-released at this point
+  bool held = false;         // attached, compositor not yet released it
+  bool initialized = false;  // has been rendered at least once
 };
 
 class App {
@@ -242,6 +257,9 @@ class App {
   bool InitVulkan();
   bool CreatePresentRing();
   bool CreateWlBuffer(Slot& s, int index);
+  bool InitExplicitSync();  // wp_linux_drm_syncobj timelines, if advertised
+  bool CreateTimeline(VkSemaphore& sem,
+                      wl::WlPtr<DrmSyncobjTimelineHandler>& tl);
   bool InitEngine();            // the water renderer (sim, caustics, scene)
   bool CreateSceneResources();  // size-dependent: scene pass, skybox, pipelines
   void DestroySceneResources();
@@ -262,11 +280,27 @@ class App {
   wl::WlPtr<LinuxDmabufHandler> linux_dmabuf_;
   wl::WlPtr<WlCallbackHandler> frame_callback_;
   wl::WlPtr<WlSeatHandler> seat_;
+  wl::WlPtr<DrmSyncobjManagerHandler> syncobj_mgr_;
+  wl::WlPtr<DrmSyncobjSurfaceHandler> syncobj_surface_;
+  wl::WlPtr<DrmSyncobjTimelineHandler> acquire_timeline_;
+  wl::WlPtr<DrmSyncobjTimelineHandler> release_timeline_;
 
   uint32_t compositor_name_ = 0, compositor_ver_ = 0;
   uint32_t xdg_wm_base_name_ = 0, xdg_wm_base_ver_ = 0;
   uint32_t dmabuf_name_ = 0, dmabuf_ver_ = 0;
   uint32_t seat_name_ = 0, seat_ver_ = 0;
+  uint32_t syncobj_name_ = 0, syncobj_ver_ = 0;
+
+  // Explicit sync (wp_linux_drm_syncobj): two Vulkan timeline semaphores
+  // exported as DRM syncobjs. We signal acquire_sem_; the compositor signals
+  // release_sem_. explicit_sync_ is false when the protocol is absent (then the
+  // implicit foreign-transfer path is used).
+  bool explicit_sync_ = false;
+  VkSemaphore acquire_sem_ = VK_NULL_HANDLE;
+  VkSemaphore release_sem_ = VK_NULL_HANDLE;
+  uint64_t acquire_value_ = 0, release_value_ = 0;
+  int next_slot_ = 0;  // round-robin cursor (explicit-sync path)
+  PFN_vkGetSemaphoreFdKHR get_semaphore_fd_ = nullptr;
   bool configured_ = false;
   bool running_ = true;
   bool deferred_ = false;  // a frame was due but no slot was free
@@ -389,6 +423,11 @@ bool App::BindGlobals() {
     } else if (iface == wl_seat_traits::interface_name) {
       seat_name_ = name;
       seat_ver_ = ver;
+    } else if (iface ==
+               linux_drm_syncobj_v1::client::
+                   wp_linux_drm_syncobj_manager_v1_traits::interface_name) {
+      syncobj_name_ = name;
+      syncobj_ver_ = ver;
     }
   });
 
@@ -444,6 +483,17 @@ bool App::BindGlobals() {
     if (!wl::RoundtripWithTimeout(display_.Get(), kRoundtripTimeoutMs))
       return false;
   }
+
+  // wp_linux_drm_syncobj (optional): explicit sync. Request-only, so attach
+  // with no listener. The timelines + surface object are set up once Vulkan
+  // exists.
+  if (syncobj_name_) {
+    using mgr =
+        linux_drm_syncobj_v1::client::wp_linux_drm_syncobj_manager_v1_traits;
+    if (wl_proxy* raw = registry_.Bind<mgr>(
+            syncobj_name_, std::min(syncobj_ver_, mgr::version)))
+      syncobj_mgr_.Attach(raw);
+  }
   return true;
 }
 
@@ -493,6 +543,8 @@ bool App::InitVulkan() {
       reinterpret_cast<PFN_vkGetImageDrmFormatModifierPropertiesEXT>(
           vkGetDeviceProcAddr(device_->handle(),
                               "vkGetImageDrmFormatModifierPropertiesEXT"));
+  get_semaphore_fd_ = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(
+      vkGetDeviceProcAddr(device_->handle(), "vkGetSemaphoreFdKHR"));
   if (!get_memory_fd_ || !get_mod_props_) {
     std::fprintf(stderr,
                  "water_window: required dma-buf entry points missing\n");
@@ -508,7 +560,73 @@ bool App::InitVulkan() {
     return false;
   std::printf("water_window: device '%s'\n",
               device_->caps().device_name.c_str());
-  return CreatePresentRing() && InitEngine();
+  return CreatePresentRing() && InitEngine() && InitExplicitSync();
+}
+
+// Set up wp_linux_drm_syncobj explicit sync if the compositor offers it: two
+// Vulkan timeline semaphores exported as DRM syncobjs and imported as the
+// acquire/release timelines, plus a syncobj surface object. Best-effort — on
+// any failure we fall back to the implicit foreign-transfer path.
+bool App::CreateTimeline(VkSemaphore& sem,
+                         wl::WlPtr<DrmSyncobjTimelineHandler>& tl) {
+  using mgr =
+      linux_drm_syncobj_v1::client::wp_linux_drm_syncobj_manager_v1_traits;
+  using tl_traits =
+      linux_drm_syncobj_v1::client::wp_linux_drm_syncobj_timeline_v1_traits;
+  VkDevice dev = device_->handle();
+  const VkSemaphoreTypeCreateInfo type{
+      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+      .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+      .initialValue = 0};
+  const VkExportSemaphoreCreateInfo exp{
+      .sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+      .pNext = &type,
+      .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT};
+  const VkSemaphoreCreateInfo ci{
+      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &exp};
+  if (vkCreateSemaphore(dev, &ci, nullptr, &sem) != VK_SUCCESS)
+    return false;
+  const VkSemaphoreGetFdInfoKHR gi{
+      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+      .semaphore = sem,
+      .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT};
+  int fd = -1;
+  if (get_semaphore_fd_(dev, &gi, &fd) != VK_SUCCESS || fd < 0)
+    return false;
+  // import_timeline: libwayland dups the fd while marshalling; close ours
+  // after.
+  wl_proxy* raw = wl::construct<tl_traits, mgr::Op::ImportTimeline>(
+      *syncobj_mgr_.Get(), fd);
+  close(fd);
+  if (!raw)
+    return false;
+  tl.Attach(raw);
+  return true;
+}
+
+bool App::InitExplicitSync() {
+  if (std::getenv("WATER_NO_EXPLICIT_SYNC") || !get_semaphore_fd_ ||
+      syncobj_mgr_.IsNull())
+    return true;  // forced off, or protocol / entry point absent — implicit
+  using mgr =
+      linux_drm_syncobj_v1::client::wp_linux_drm_syncobj_manager_v1_traits;
+  using surf =
+      linux_drm_syncobj_v1::client::wp_linux_drm_syncobj_surface_v1_traits;
+  if (!CreateTimeline(acquire_sem_, acquire_timeline_) ||
+      !CreateTimeline(release_sem_, release_timeline_)) {
+    std::fprintf(stderr,
+                 "water_window: timeline syncobj setup failed; "
+                 "using implicit sync\n");
+    return true;
+  }
+  wl_proxy* raw = wl::construct<surf, mgr::Op::GetSurface>(
+      *syncobj_mgr_.Get(), surface_.Get()->GetProxy());
+  if (!raw)
+    return true;
+  syncobj_surface_.Attach(raw);
+  explicit_sync_ = true;
+  std::printf("water_window: explicit sync via wp_linux_drm_syncobj\n");
+  return true;
 }
 
 bool App::CreatePresentRing() {
@@ -814,6 +932,18 @@ void App::RecordEngine(VkCommandBuffer cmd) {
 }
 
 int App::Acquire() {
+  if (explicit_sync_) {
+    // Round-robin. The per-slot fence gates command-buffer reuse on GPU-done;
+    // overwriting the dma-buf waits on the compositor's read via the implicit
+    // reservation fence engaged by the FOREIGN re-acquire. mutter signals no
+    // release point or wl_buffer.release here, so we don't gate on those.
+    const int i = next_slot_;
+    next_slot_ = (next_slot_ + 1) % kNumBuffers;
+    if (slots_[i].initialized)
+      vkWaitForFences(device_->handle(), 1, &slots_[i].fence, VK_TRUE,
+                      100'000'000);  // ~always already signalled
+    return i;
+  }
   for (int i = 0; i < kNumBuffers; ++i) {
     Slot& s = slots_[i];
     if (s.held)
@@ -850,8 +980,9 @@ void App::RenderFrame() {
   const uint32_t mine = device_->queue_family();
 
   // One command buffer per frame: the whole engine render, then the dma-buf
-  // hand-off — submitted once, with no CPU wait (the slot fence + the FOREIGN
-  // ownership transfer carry the synchronization).
+  // hand-off — submitted once with no CPU wait. Synchronization to the
+  // compositor is the explicit acquire/release timeline when available, else
+  // the implicit FOREIGN-transfer dma-buf fence.
   vkResetCommandBuffer(s.cmd, 0);
   const VkCommandBufferBeginInfo bi{
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -860,9 +991,11 @@ void App::RenderFrame() {
 
   RecordEngine(s.cmd);  // sim + caustics + scene -> scene_->color()
 
-  // Acquire the slot for writing. First use: from UNDEFINED. Reuse: reclaim
-  // ownership from the compositor (FOREIGN) — the matching half of the release
-  // below, which is what arms implicit dma-buf fencing.
+  // Acquire the present image for writing. First use: from UNDEFINED. Reuse:
+  // reclaim ownership from the compositor (FOREIGN) — the proper Vulkan
+  // hand-off for an external consumer. The fence (when does the compositor
+  // read) is the explicit acquire timeline below; implicitly, the dma-buf
+  // reservation fence.
   if (!s.initialized) {
     ImageBarrier(
         s.cmd, s.image, VK_IMAGE_LAYOUT_UNDEFINED,
@@ -886,7 +1019,7 @@ void App::RenderFrame() {
   vkCmdCopyImage(s.cmd, scene_->color().image,
                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.image,
                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-  // Release the slot to the compositor (FOREIGN): hands off with implicit sync.
+  // Release the slot to the compositor (FOREIGN) for scanout.
   ImageBarrier(s.cmd, s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, 0,
                VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -894,16 +1027,44 @@ void App::RenderFrame() {
                VK_QUEUE_FAMILY_FOREIGN_EXT);
   vkEndCommandBuffer(s.cmd);
 
-  vkResetFences(dev, 1, &s.fence);
-  const VkSubmitInfo si{.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                        .commandBufferCount = 1,
-                        .pCommandBuffers = &s.cmd};
-  if (vkQueueSubmit(device_->queue(), 1, &si, s.fence) != VK_SUCCESS) {
-    running_ = false;
-    return;
+  if (explicit_sync_) {
+    // Signal the acquire timeline when the GPU work retires; tell the
+    // compositor to wait for it (acquire point) and to signal the release point
+    // when done.
+    const uint64_t acquire_pt = ++acquire_value_;
+    const VkTimelineSemaphoreSubmitInfo tssi{
+        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+        .signalSemaphoreValueCount = 1,
+        .pSignalSemaphoreValues = &acquire_pt};
+    const VkSubmitInfo si{.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                          .pNext = &tssi,
+                          .commandBufferCount = 1,
+                          .pCommandBuffers = &s.cmd,
+                          .signalSemaphoreCount = 1,
+                          .pSignalSemaphores = &acquire_sem_};
+    vkResetFences(dev, 1, &s.fence);  // also a GPU-done gate for cmd reuse
+    if (vkQueueSubmit(device_->queue(), 1, &si, s.fence) != VK_SUCCESS) {
+      running_ = false;
+      return;
+    }
+    s.release_pt = ++release_value_;
+    auto* so = syncobj_surface_.Get();
+    so->SetAcquirePoint(acquire_timeline_.Get()->GetProxy(),
+                        uint32_t(acquire_pt >> 32), uint32_t(acquire_pt));
+    so->SetReleasePoint(release_timeline_.Get()->GetProxy(),
+                        uint32_t(s.release_pt >> 32), uint32_t(s.release_pt));
+  } else {
+    vkResetFences(dev, 1, &s.fence);
+    const VkSubmitInfo si{.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                          .commandBufferCount = 1,
+                          .pCommandBuffers = &s.cmd};
+    if (vkQueueSubmit(device_->queue(), 1, &si, s.fence) != VK_SUCCESS) {
+      running_ = false;
+      return;
+    }
+    s.held = true;
   }
 
-  s.held = true;
   RequestFrameCallback();  // before commit, same batch
   surface_.Get()->Attach(s.wl_buffer.Get()->GetProxy(), 0, 0);
   surface_.Get()->Damage(0, 0, width_, height_);
@@ -984,6 +1145,10 @@ App::~App() {
     vkDestroySampler(dev, clamp_, nullptr);
   if (repeat_)
     vkDestroySampler(dev, repeat_, nullptr);
+  if (acquire_sem_)
+    vkDestroySemaphore(dev, acquire_sem_, nullptr);
+  if (release_sem_)
+    vkDestroySemaphore(dev, release_sem_, nullptr);
   if (pool_)
     vkDestroyCommandPool(dev, pool_, nullptr);
 }

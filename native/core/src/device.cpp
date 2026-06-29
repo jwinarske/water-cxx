@@ -182,9 +182,18 @@ Result<Device> Device::create(const DeviceConfig& cfg) {
     // dma-buf fencing, so an external consumer (compositor / KMS) waits on our
     // GPU writes without a CPU stall — the producer-side acquire fence.
     dev_exts.push_back(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
+    // Export semaphores as sync_file / DRM-syncobj fds for explicit-sync
+    // present (wp_linux_drm_syncobj timeline points).
+    dev_exts.push_back(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
   }
+  // Timeline semaphores back the explicit-sync acquire/release timelines.
+  const VkPhysicalDeviceTimelineSemaphoreFeatures timeline_feat{
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
+      .timelineSemaphore = VK_TRUE,
+  };
   const VkDeviceCreateInfo dci{
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+      .pNext = cfg.dmabuf_export ? &timeline_feat : nullptr,
       .queueCreateInfoCount = 1,
       .pQueueCreateInfos = &qci,
       .enabledExtensionCount = uint32_t(dev_exts.size()),

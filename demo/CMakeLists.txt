@@ -62,3 +62,7 @@ wayland_cxx_generate(PROTOCOL ${WP_DIR}/stable/xdg-shell/xdg-shell.xml
                      MODE client-header OUTPUT gen/xdg_shell_client.hpp TARGET water_window)
 wayland_cxx_generate(PROTOCOL ${WP_DIR}/unstable/linux-dmabuf/linux-dmabuf-unstable-v1.xml
                      MODE client-header OUTPUT gen/linux_dmabuf_client.hpp TARGET water_window)
+# Self-contained tables (no wl/ helper header for this protocol).
+wayland_cxx_generate(PROTOCOL ${WP_DIR}/staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml
+                     MODE client-header OUTPUT gen/drm_syncobj_client.hpp
+                     EMIT_INTERFACE_TABLES TARGET water_window)
