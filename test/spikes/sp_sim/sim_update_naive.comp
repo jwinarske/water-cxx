@@ -1,0 +1,24 @@
+// SPDX-FileCopyrightText: (c) 2026 Joel Winarske
+// SPDX-License-Identifier: MIT
+#version 450
+// Naive compute update: 4-tap gather straight from global memory (5 imageLoads/thread).
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D uSrc;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D uDst;
+
+void main() {
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 sz = imageSize(uSrc);
+  if (p.x >= sz.x || p.y >= sz.y) return;
+  ivec2 l = ivec2(max(p.x - 1, 0), p.y);
+  ivec2 r = ivec2(min(p.x + 1, sz.x - 1), p.y);
+  ivec2 d = ivec2(p.x, max(p.y - 1, 0));
+  ivec2 u = ivec2(p.x, min(p.y + 1, sz.y - 1));
+  vec4 info = imageLoad(uSrc, p);
+  float avg = (imageLoad(uSrc, l).r + imageLoad(uSrc, d).r +
+               imageLoad(uSrc, r).r + imageLoad(uSrc, u).r) * 0.25;
+  info.g += (avg - info.r) * 2.0;
+  info.g *= 0.995;
+  info.r += info.g;
+  imageStore(uDst, p, info);
+}

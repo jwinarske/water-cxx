@@ -1,0 +1,22 @@
+# Build trees
+/build*/
+/cmake-build*/
+**/*.o
+**/*.so
+**/*.a
+
+# Generated shader blobs
+**/generated/
+*.spv
+
+# Editor / OS
+.cache/
+compile_commands.json
+.DS_Store
+
+# Spike capture artifacts
+*.png
+!docs/**/*.png
+
+# internal design doc — not committed
+/docs/

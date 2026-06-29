@@ -1,0 +1,38 @@
+// SPDX-FileCopyrightText: (c) 2026 Joel Winarske
+// SPDX-License-Identifier: MIT
+#version 450
+// LDS-tiled compute update (mobile sim path): load a 16x16 workgroup
+// tile + 1-texel halo of heights into shared memory once, then read the 4-tap from LDS.
+// ~1 global height load/thread vs 5 in the naive path — the bandwidth lever on tilers.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D uSrc;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D uDst;
+
+const int TILE = 16;
+const int HALO = TILE + 2;  // 18
+shared float h[HALO][HALO];
+
+void main() {
+  ivec2 sz = imageSize(uSrc);
+  ivec2 base = ivec2(gl_WorkGroupID.xy) * TILE - 1;  // top-left incl. halo
+  uint tid = gl_LocalInvocationIndex;
+  // 256 threads cooperatively load 18*18 = 324 height texels.
+  for (uint i = tid; i < uint(HALO * HALO); i += uint(TILE * TILE)) {
+    int row = int(i) / HALO;
+    int col = int(i) % HALO;
+    ivec2 t = clamp(base + ivec2(col, row), ivec2(0), sz - 1);
+    h[row][col] = imageLoad(uSrc, t).r;
+  }
+  barrier();
+
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (p.x >= sz.x || p.y >= sz.y) return;
+  ivec2 lp = ivec2(gl_LocalInvocationID.xy) + 1;  // +1 for halo offset
+  float avg = (h[lp.y][lp.x - 1] + h[lp.y - 1][lp.x] +
+               h[lp.y][lp.x + 1] + h[lp.y + 1][lp.x]) * 0.25;
+  vec4 info = imageLoad(uSrc, p);  // velocity (g) still comes from global
+  info.g += (avg - info.r) * 2.0;
+  info.g *= 0.995;
+  info.r += info.g;
+  imageStore(uDst, p, info);
+}
