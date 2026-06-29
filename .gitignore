@@ -17,7 +17,8 @@ compile_commands.json
 # Spike capture artifacts
 *.png
 !docs/**/*.png
-!screenshots/*.png  # committed README imagery
+# committed README imagery
+!screenshots/*.png
 
 # internal design doc — not committed
 /docs/
