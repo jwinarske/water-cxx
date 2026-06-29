@@ -40,13 +40,25 @@ extern "C" {
 #include <wl/wl_ptr.hpp>          // WlPtr
 #include <wl/xdg_shell.hpp>       // XDG interface tables + CRTP handlers
 
+#include "water/camera.hpp"
+#include "water/caustics_pass.hpp"
 #include "water/device.hpp"
+#include "water/heightfield_sim.hpp"
+#include "water/mesh.hpp"
+#include "water/scene_pass.hpp"
+#include "water/skybox.hpp"
+#include "water/texture.hpp"
+
+#include "scene_shaders.h"
+
+#include <glm/glm.hpp>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <optional>
+#include <span>
 #include <string_view>
 
 // Core-Wayland wl_interface tables come from libwayland-client; map the
@@ -156,7 +168,9 @@ class App {
   bool InitVulkan();
   bool CreatePresentRing();
   bool CreateWlBuffer(Slot& s, int index);
-  int Acquire();  // a free slot (released + GPU-retired), or -1
+  bool InitEngine();    // the water renderer (sim, caustics, scene)
+  void RenderEngine();  // advance + render one frame into scene colour
+  int Acquire();        // a free slot (released + GPU-retired), or -1
   void RenderFrame();
   void RequestFrameCallback();
 
@@ -183,6 +197,23 @@ class App {
   PFN_vkGetImageDrmFormatModifierPropertiesEXT get_mod_props_ = nullptr;
   VkCommandPool pool_ = VK_NULL_HANDLE;
   Slot slots_[kNumBuffers];
+
+  // ── Water engine (declared after device_ so they tear down before it) ──────
+  VkSampler clamp_ = VK_NULL_HANDLE;
+  VkSampler repeat_ = VK_NULL_HANDLE;
+  water::Texture tiles_{};
+  water::Texture sky_{};
+  std::optional<water::HeightfieldSim> sim_;
+  std::optional<water::CausticsPass> caustics_;
+  std::optional<water::ScenePass> scene_;
+  std::optional<water::Skybox> skybox_;
+  water::Mesh plane_{}, pool_mesh_{}, sphere_{};
+  VkPipeline pool_pipe_ = VK_NULL_HANDLE, sphere_pipe_ = VK_NULL_HANDLE;
+  VkPipeline above_pipe_ = VK_NULL_HANDLE, below_pipe_ = VK_NULL_HANDLE;
+  VkDescriptorSet water_set_ = VK_NULL_HANDLE, surf_ = VK_NULL_HANDLE;
+  water::OrbitCamera cam_;
+  water::ScenePush push_{};
+  uint64_t frame_ = 0;
 };
 
 // ── Vulkan helpers ───────────────────────────────────────────────────────────
@@ -337,7 +368,7 @@ bool App::InitVulkan() {
     return false;
   std::printf("water_window: device '%s'\n",
               device_->caps().device_name.c_str());
-  return CreatePresentRing();
+  return CreatePresentRing() && InitEngine();
 }
 
 bool App::CreatePresentRing() {
@@ -471,6 +502,155 @@ bool App::CreateWlBuffer(Slot& s, int index) {
   return true;
 }
 
+// ── Water engine ─────────────────────────────────────────────────────────────
+
+#define ASSET(name) (WATER_ASSET_DIR "/" name)
+// Unwrap a water::Result into `dst`, logging + returning false on error.
+#define ENG_TRY(dst, expr)                                                 \
+  do {                                                                     \
+    auto _r = (expr);                                                      \
+    if (!_r) {                                                             \
+      std::fprintf(stderr, "water_window: engine init: %.*s\n",            \
+                   int(_r.error().where.size()), _r.error().where.data()); \
+      return false;                                                        \
+    }                                                                      \
+    (dst) = std::move(*_r);                                                \
+  } while (0)
+
+bool App::InitEngine() {
+  using namespace water;
+  Device& dev = *device_;
+
+  ENG_TRY(clamp_, make_sampler(dev, VK_FILTER_LINEAR,
+                               VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, 0.0f));
+  ENG_TRY(repeat_,
+          make_sampler(dev, VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_REPEAT,
+                       VK_LOD_CLAMP_NONE));
+  ENG_TRY(tiles_, load_texture_2d(dev, ASSET("tiles.jpg"), true));
+  ENG_TRY(sky_, load_cubemap(dev, {ASSET("xpos.jpg"), ASSET("xneg.jpg"),
+                                   ASSET("ypos.jpg"), ASSET("ypos.jpg"),
+                                   ASSET("zpos.jpg"), ASSET("zneg.jpg")}));
+
+  {
+    auto r = HeightfieldSim::create(dev, 256);
+    if (!r)
+      return false;
+    sim_.emplace(std::move(*r));
+  }
+  if (!dev.submit_now([&](VkCommandBuffer cmd) {
+        sim_->clear(cmd);
+        const glm::vec2 drops[] = {
+            {0, 0}, {0.4f, 0.3f}, {-0.4f, -0.2f}, {0.3f, -0.4f}, {-0.3f, 0.4f}};
+        for (auto d : drops)
+          sim_->add_drop(cmd, d, 0.05f, 0.5f);
+        for (int i = 0; i < 30; ++i)
+          sim_->step(cmd);
+      }))
+    return false;
+
+  {
+    auto r = CausticsPass::create(dev, 1024, 2);
+    if (!r)
+      return false;
+    caustics_.emplace(std::move(*r));
+  }
+  ENG_TRY(plane_, upload_mesh(dev, make_plane(200)));
+  ENG_TRY(pool_mesh_, upload_mesh(dev, make_pool()));
+  ENG_TRY(sphere_, upload_mesh(dev, make_sphere(32)));
+  ENG_TRY(water_set_, caustics_->make_water_set(sim_->current().view, clamp_));
+
+  {
+    auto r = ScenePass::create(dev, uint32_t(width_), uint32_t(height_));
+    if (!r)
+      return false;
+    scene_.emplace(std::move(*r));
+  }
+  {
+    auto r = Skybox::create(dev, scene_->render_pass(), sky_, clamp_);
+    if (!r)
+      return false;
+    skybox_.emplace(std::move(*r));
+  }
+  ENG_TRY(surf_, scene_->make_surface_set({{{sim_->current().view, clamp_},
+                                            {tiles_.view, repeat_},
+                                            {caustics_->image(0).view, clamp_},
+                                            {sky_.view, clamp_}}}));
+
+  auto P = [&](std::span<const uint32_t> v, std::span<const uint32_t> f,
+               VkCullModeFlags c) {
+    return scene_->make_pipeline({.vert = v, .frag = f, .cull = c});
+  };
+  ENG_TRY(pool_pipe_, P(std::span(pool_vert_spv, pool_vert_spv_count),
+                        std::span(pool_frag_spv, pool_frag_spv_count),
+                        VK_CULL_MODE_BACK_BIT));
+  ENG_TRY(sphere_pipe_, P(std::span(sphere_vert_spv, sphere_vert_spv_count),
+                          std::span(sphere_frag_spv, sphere_frag_spv_count),
+                          VK_CULL_MODE_NONE));
+  ENG_TRY(above_pipe_,
+          P(std::span(water_vert_spv, water_vert_spv_count),
+            std::span(water_above_frag_spv, water_above_frag_spv_count),
+            VK_CULL_MODE_FRONT_BIT));
+  ENG_TRY(below_pipe_,
+          P(std::span(water_vert_spv, water_vert_spv_count),
+            std::span(water_below_frag_spv, water_below_frag_spv_count),
+            VK_CULL_MODE_BACK_BIT));
+
+  const glm::vec3 light = glm::normalize(glm::vec3(2.0f, 2.0f, -1.0f));
+  push_.light = glm::vec4(light, 0.0f);
+  std::printf("water_window: engine ready (scene %dx%d)\n", width_, height_);
+  return true;
+}
+
+// Advance the sim and render one composited frame into scene_->color().
+// The engine's multi-pass stages keep the tested per-stage submit boundaries;
+// the present hand-off (below) is the zero-CPU-wait part.
+void App::RenderEngine() {
+  using namespace water;
+  Device& dev = *device_;
+  ++frame_;
+
+  const glm::mat4 vp = cam_.view_projection(scene_->aspect());
+  push_.vp = vp;
+  push_.eye = glm::vec4(cam_.position(), 1.0f);
+  const float t = float(frame_) * 0.03f;
+  push_.sphere = glm::vec4(-0.4f, -0.75f + 0.05f * std::sin(t), 0.2f, 0.25f);
+
+  // 1) sim: an even number of ping-pong swaps per frame keeps current() at the
+  // image our descriptors are baked to (a drop is added as a pair = 2 swaps).
+  if (!dev.submit_now([&](VkCommandBuffer cmd) {
+        if (frame_ % 50 == 0) {
+          const glm::vec2 p(0.6f * std::sin(t * 1.3f),
+                            0.6f * std::cos(t * 0.7f));
+          sim_->add_drop(cmd, p, 0.04f, 0.5f);
+          sim_->add_drop(cmd, p, 0.04f, 0.5f);
+        }
+        sim_->step(cmd);
+        sim_->step(cmd);
+      })) {
+    running_ = false;
+    return;
+  }
+  // 2) caustics from the light's POV.
+  if (!dev.submit_now([&](VkCommandBuffer cmd) {
+        caustics_->render(cmd, 0, push_, plane_, water_set_);
+      })) {
+    running_ = false;
+    return;
+  }
+  // 3) the composited scene -> scene_->color() (left TRANSFER_SRC_OPTIMAL).
+  if (!dev.submit_now([&](VkCommandBuffer cmd) {
+        scene_->begin(cmd, {0, 0, 0, 1});
+        skybox_->record(cmd, glm::inverse(vp), cam_.position());
+        scene_->draw(cmd, pool_pipe_, push_, pool_mesh_, surf_);
+        scene_->draw(cmd, above_pipe_, push_, plane_, surf_);
+        scene_->draw(cmd, below_pipe_, push_, plane_, surf_);
+        scene_->draw(cmd, sphere_pipe_, push_, sphere_, surf_);
+        scene_->end(cmd);
+      })) {
+    running_ = false;
+  }
+}
+
 int App::Acquire() {
   for (int i = 0; i < kNumBuffers; ++i) {
     Slot& s = slots_[i];
@@ -503,14 +683,14 @@ void App::RenderFrame() {
   VkDevice dev = device_->handle();
   const uint32_t mine = device_->queue_family();
 
-  // Animated clear colour (cycling hue) to prove frames are flowing; the engine
-  // scene blits in here next.
-  static float t = 0.0f;
-  t += 0.02f;
-  const VkClearColorValue clear{{0.5f + 0.5f * std::sin(t),
-                                 0.5f + 0.5f * std::sin(t + 2.094f),
-                                 0.5f + 0.5f * std::sin(t + 4.188f), 1.0f}};
+  // Render the water into scene_->color() (CPU-synced, tested per-stage path).
+  RenderEngine();
+  if (!running_)
+    return;
 
+  // Hand-off: copy the scene into the slot's dma-buf and release it to the
+  // compositor — submitted without a CPU wait (the slot's fence + the FOREIGN
+  // ownership transfer carry the synchronisation).
   vkResetCommandBuffer(s.cmd, 0);
   const VkCommandBufferBeginInfo bi{
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -533,9 +713,15 @@ void App::RenderFrame() {
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_QUEUE_FAMILY_FOREIGN_EXT, mine);
   }
-  const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  vkCmdClearColorImage(s.cmd, s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                       &clear, 1, &range);
+  // scene_->color() is already TRANSFER_SRC_OPTIMAL and fully written (the
+  // engine submits above CPU-waited), so a same-size copy needs no src barrier.
+  const VkImageCopy region{
+      .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+      .extent = {uint32_t(width_), uint32_t(height_), 1}};
+  vkCmdCopyImage(s.cmd, scene_->color().image,
+                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.image,
+                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
   // Release the slot to the compositor (FOREIGN): hands off with implicit sync.
   ImageBarrier(s.cmd, s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, 0,
@@ -581,6 +767,17 @@ App::~App() {
     return;
   VkDevice dev = device_->handle();
   vkDeviceWaitIdle(dev);
+  // Engine objects without RAII handles (pipelines/sets are owned by the
+  // passes; the passes themselves tear down as members before device_).
+  water::destroy_mesh(*device_, plane_);
+  water::destroy_mesh(*device_, pool_mesh_);
+  water::destroy_mesh(*device_, sphere_);
+  water::destroy_texture(*device_, tiles_);
+  water::destroy_texture(*device_, sky_);
+  if (clamp_)
+    vkDestroySampler(dev, clamp_, nullptr);
+  if (repeat_)
+    vkDestroySampler(dev, repeat_, nullptr);
   for (auto& s : slots_) {
     if (s.fence)
       vkDestroyFence(dev, s.fence, nullptr);

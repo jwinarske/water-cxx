@@ -22,12 +22,37 @@ set(WAYLAND_CXX_SCANNER_EXECUTABLE "$<TARGET_FILE:wayland-cxx-scanner>")
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(WLCLIENT REQUIRED IMPORTED_TARGET wayland-client)
+pkg_check_modules(LIBDRM REQUIRED IMPORTED_TARGET libdrm)  # drm_fourcc.h
 pkg_get_variable(WS_DIR wayland-scanner pkgdatadir)
 pkg_get_variable(WP_DIR wayland-protocols pkgdatadir)
 
-add_executable(water_window water_window.cpp)
+# Scene pipelines are created in the demo from embedded SPIR-V (same set the
+# engine tests use).
+include(EmbedShaders)
+water_embed_shaders(
+  HEADER ${CMAKE_CURRENT_BINARY_DIR}/gen/scene_shaders.h
+  OUTVAR SCENE_SHADERS
+  INCLUDES
+    ${CMAKE_SOURCE_DIR}/shaders/surface_push.glsl
+    ${CMAKE_SOURCE_DIR}/shaders/intersect.glsl
+    ${CMAKE_SOURCE_DIR}/shaders/surface_common.glsl
+    ${CMAKE_SOURCE_DIR}/shaders/water_common.glsl
+  SHADERS
+    ${CMAKE_SOURCE_DIR}/shaders/pool.vert
+    ${CMAKE_SOURCE_DIR}/shaders/sphere.vert
+    ${CMAKE_SOURCE_DIR}/shaders/debug_scene.frag
+    ${CMAKE_SOURCE_DIR}/shaders/pool.frag
+    ${CMAKE_SOURCE_DIR}/shaders/sphere.frag
+    ${CMAKE_SOURCE_DIR}/shaders/water.vert
+    ${CMAKE_SOURCE_DIR}/shaders/water_above.frag
+    ${CMAKE_SOURCE_DIR}/shaders/water_below.frag)
+
+add_executable(water_window water_window.cpp ${SCENE_SHADERS})
 target_link_libraries(water_window PRIVATE water_core wayland-cxx::wayland-cxx
-                      PkgConfig::WLCLIENT)
+                      PkgConfig::WLCLIENT PkgConfig::LIBDRM)
+target_include_directories(water_window PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/gen)
+target_compile_definitions(water_window PRIVATE
+                           WATER_ASSET_DIR="${CMAKE_SOURCE_DIR}/assets")
 target_compile_options(water_window PRIVATE -Wno-unused-parameter)
 
 # Generate the type-safe client headers from the system protocol XMLs.
