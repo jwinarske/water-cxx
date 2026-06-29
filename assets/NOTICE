@@ -1,0 +1,6 @@
+tiles.jpg, xpos.jpg, xneg.jpg, ypos.jpg, zpos.jpg, zneg.jpg
+
+These textures are from Evan Wallace's WebGL Water (http://madebyevan.com/webgl-water/),
+Copyright 2011 Evan Wallace, released under the MIT license. They are the original
+demo's pool tile and sky cubemap faces (the asset set has no -Y face; +Y is reused
+for both poles, exactly as upstream — see water::load_cubemap).
