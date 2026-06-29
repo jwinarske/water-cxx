@@ -157,6 +157,13 @@ Result<Device> Device::create(const DeviceConfig& cfg) {
   if (cfg.dmabuf_export) {
     dev_exts.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
     dev_exts.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+    // Allocate exportable images by DRM format modifier (the compatible,
+    // validation-clean way to make dma-buf/scanout images — not plain LINEAR).
+    dev_exts.push_back(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+    // Ownership transfer to VK_QUEUE_FAMILY_FOREIGN_EXT engages implicit
+    // dma-buf fencing, so an external consumer (compositor / KMS) waits on our
+    // GPU writes without a CPU stall — the producer-side acquire fence.
+    dev_exts.push_back(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
   }
   const VkDeviceCreateInfo dci{
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
