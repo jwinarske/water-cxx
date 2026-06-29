@@ -29,8 +29,9 @@
 
 extern "C" {
 #include <drm_fourcc.h>  // DRM_FORMAT_ABGR8888, DRM_FORMAT_MOD_LINEAR
-#include <unistd.h>      // close()
-#include <wayland-client-protocol.h>  // wl_*_interface symbols
+#include <linux/input-event-codes.h>  // BTN_LEFT, KEY_ESC
+#include <unistd.h>                   // close()
+#include <wayland-client-protocol.h>  // wl_*_interface symbols + capabilities
 }
 
 #include <wl/client_helpers.hpp>  // SetupHandler, BindHandler, RunEventLoop
@@ -61,6 +62,8 @@ extern "C" {
 #include <optional>
 #include <span>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 // Core-Wayland wl_interface tables come from libwayland-client; map the
 // generated traits onto them. (xdg-shell + linux-dmabuf tables come from wl/.)
@@ -76,6 +79,15 @@ const wl_interface& wl_callback_traits::wl_iface() noexcept {
 }
 const wl_interface& wl_buffer_traits::wl_iface() noexcept {
   return wl_buffer_interface;
+}
+const wl_interface& wl_seat_traits::wl_iface() noexcept {
+  return wl_seat_interface;
+}
+const wl_interface& wl_pointer_traits::wl_iface() noexcept {
+  return wl_pointer_interface;
+}
+const wl_interface& wl_keyboard_traits::wl_iface() noexcept {
+  return wl_keyboard_interface;
 }
 }  // namespace wayland::client
 
@@ -131,6 +143,52 @@ class LinuxBufferParamsHandler
     : public linux_dmabuf_unstable_v1::client::CZwpLinuxBufferParamsV1<
           LinuxBufferParamsHandler> {};
 
+// What a left-drag does, decided by what the press ray hit (main.js model).
+enum class Drag { None, Orbit, Ball, Drops };
+
+// wl_pointer: orbit / drag-the-ball / paint-drops + wheel zoom. Forwards to App
+// (methods defined after App).
+class WlPointerHandler : public wayland::client::CWlPointer<WlPointerHandler> {
+ public:
+  App* app_ = nullptr;
+  void OnMotion(uint32_t, wl_fixed_t sx, wl_fixed_t sy) override;
+  void OnButton(uint32_t, uint32_t, uint32_t button, uint32_t state) override;
+  void OnAxis(uint32_t, uint32_t axis, wl_fixed_t value) override;
+  void OnLeave(uint32_t, wl_proxy*) override;
+};
+
+// wl_keyboard: ESC quits. Raw evdev keycodes (no xkbcommon needed here).
+class WlKeyboardHandler
+    : public wayland::client::CWlKeyboard<WlKeyboardHandler> {
+ public:
+  App* app_ = nullptr;
+  void OnKey(uint32_t, uint32_t, uint32_t key, uint32_t state) override;
+};
+
+// wl_seat: creates the pointer / keyboard when the capabilities arrive.
+class WlSeatHandler : public wayland::client::CWlSeat<WlSeatHandler> {
+ public:
+  App* app_ = nullptr;
+  wl::WlPtr<WlPointerHandler> pointer_;
+  wl::WlPtr<WlKeyboardHandler> keyboard_;
+
+  void OnCapabilities(uint32_t caps) override {
+    using namespace wayland::client;
+    if ((caps & WL_SEAT_CAPABILITY_POINTER) && pointer_.IsNull() &&
+        wl::SetupHandler(
+            pointer_,
+            wl::construct<wl_pointer_traits, wl_seat_traits::Op::GetPointer>(
+                *this)))
+      pointer_.Get()->app_ = app_;
+    if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && keyboard_.IsNull() &&
+        wl::SetupHandler(
+            keyboard_,
+            wl::construct<wl_keyboard_traits, wl_seat_traits::Op::GetKeyboard>(
+                *this)))
+      keyboard_.Get()->app_ = app_;
+  }
+};
+
 // One ring slot: an exportable, linear, dma-buf-backed present image plus its
 // per-slot command buffer / fence and lifecycle state.
 struct Slot {
@@ -165,6 +223,13 @@ class App {
   void OnFrameReady(uint32_t time_ms);
   void OnBufferRelease(int slot);
 
+  // Input (forwarded by the pointer / keyboard handlers).
+  void OnPointerMotion(double x, double y);
+  void OnPointerButton(uint32_t button, uint32_t state);
+  void OnPointerAxis(double value);
+  void OnPointerLeave() { drag_ = Drag::None; }
+  void OnKey(uint32_t key, uint32_t state);
+
  private:
   bool BindGlobals();
   bool CreateWindow();
@@ -186,10 +251,12 @@ class App {
   wl::WlPtr<wl::XdgToplevelHandler<App>> xdg_toplevel_;
   wl::WlPtr<LinuxDmabufHandler> linux_dmabuf_;
   wl::WlPtr<WlCallbackHandler> frame_callback_;
+  wl::WlPtr<WlSeatHandler> seat_;
 
   uint32_t compositor_name_ = 0, compositor_ver_ = 0;
   uint32_t xdg_wm_base_name_ = 0, xdg_wm_base_ver_ = 0;
   uint32_t dmabuf_name_ = 0, dmabuf_ver_ = 0;
+  uint32_t seat_name_ = 0, seat_ver_ = 0;
   bool configured_ = false;
   bool running_ = true;
   bool deferred_ = false;  // a frame was due but no slot was free
@@ -217,6 +284,17 @@ class App {
   water::OrbitCamera cam_;
   water::ScenePush push_{};
   uint64_t frame_ = 0;
+
+  // Interaction state.
+  static constexpr float kSphereR = 0.25f;
+  glm::vec3 sphere_pos_{-0.4f, -0.75f, 0.2f};
+  std::vector<glm::vec2> pending_drops_;  // applied (and cleared) each frame
+  Drag drag_ = Drag::None;
+  double cur_x_ = 0, cur_y_ = 0, last_x_ = 0, last_y_ = 0;
+
+  // A world-space ray through window pixel (px, py) for picking.
+  [[nodiscard]] std::pair<glm::vec3, glm::vec3> PixelRay(double px,
+                                                         double py) const;
 };
 
 // ── Vulkan helpers ───────────────────────────────────────────────────────────
@@ -265,6 +343,9 @@ bool App::BindGlobals() {
     } else if (iface == dmabuf_traits::interface_name) {
       dmabuf_name_ = name;
       dmabuf_ver_ = ver;
+    } else if (iface == wl_seat_traits::interface_name) {
+      seat_name_ = name;
+      seat_ver_ = ver;
     }
   });
 
@@ -306,6 +387,19 @@ bool App::BindGlobals() {
                  "water_window: compositor does not advertise DRM_FORMAT "
                  "ABGR8888\n");
     return false;
+  }
+
+  // wl_seat (optional): pointer + keyboard for interaction. A roundtrip lets
+  // the capabilities arrive so the pointer / keyboard are created before we
+  // present.
+  if (seat_name_) {
+    if (!wl::BindHandler<wl_seat_traits>(
+            registry_, seat_, seat_name_,
+            std::min(seat_ver_, wl_seat_traits::version)))
+      return false;
+    seat_.Get()->app_ = this;
+    if (!wl::RoundtripWithTimeout(display_.Get(), kRoundtripTimeoutMs))
+      return false;
   }
   return true;
 }
@@ -615,18 +709,23 @@ void App::RenderEngine() {
   const glm::mat4 vp = cam_.view_projection(scene_->aspect());
   push_.vp = vp;
   push_.eye = glm::vec4(cam_.position(), 1.0f);
-  const float t = float(frame_) * 0.03f;
-  push_.sphere = glm::vec4(-0.4f, -0.75f + 0.05f * std::sin(t), 0.2f, 0.25f);
+  push_.sphere = glm::vec4(sphere_pos_, kSphereR);
 
-  // 1) sim: an even number of ping-pong swaps per frame keeps current() at the
-  // image our descriptors are baked to (a drop is added as a pair = 2 swaps).
+  // An idle ambient drop keeps the surface alive when no one is interacting.
+  const float t = float(frame_) * 0.03f;
+  if (frame_ % 60 == 0)
+    pending_drops_.emplace_back(0.6f * std::sin(t * 1.3f),
+                                0.6f * std::cos(t * 0.7f));
+
+  // 1) sim: apply queued drops, then 2x step. Keeping the per-frame ping-pong
+  // swap count even leaves current() at the image our descriptors are baked to;
+  // an odd number of drops gets a zero-strength pad to preserve that.
   if (!dev.submit_now([&](VkCommandBuffer cmd) {
-        if (frame_ % 50 == 0) {
-          const glm::vec2 p(0.6f * std::sin(t * 1.3f),
-                            0.6f * std::cos(t * 0.7f));
-          sim_->add_drop(cmd, p, 0.04f, 0.5f);
-          sim_->add_drop(cmd, p, 0.04f, 0.5f);
-        }
+        for (const glm::vec2& d : pending_drops_)
+          sim_->add_drop(cmd, d, 0.04f, 0.5f);
+        if (pending_drops_.size() % 2 == 1)
+          sim_->add_drop(cmd, glm::vec2(0.0f), 0.01f, 0.0f);  // parity pad
+        pending_drops_.clear();
         sim_->step(cmd);
         sim_->step(cmd);
       })) {
@@ -842,6 +941,136 @@ int App::RunShot(const char* path) {
   std::fclose(fp);
   std::printf("water_window: wrote %s (%dx%d)\n", path, width_, height_);
   return EXIT_SUCCESS;
+}
+
+// ── Picking + interaction ────────────────────────────────────────────────────
+
+// Nearest positive hit distance of ray o+t*d (d normalized) with a sphere, <0
+// if it misses.
+float HitSphere(glm::vec3 o, glm::vec3 d, glm::vec3 c, float r) {
+  const glm::vec3 oc = o - c;
+  const float b = glm::dot(oc, d);
+  const float disc = b * b - (glm::dot(oc, oc) - r * r);
+  if (disc < 0.0f)
+    return -1.0f;
+  const float s = std::sqrt(disc);
+  const float t0 = -b - s;
+  return t0 >= 0.0f ? t0 : -b + s;
+}
+
+std::pair<glm::vec3, glm::vec3> App::PixelRay(double px, double py) const {
+  const float aspect = float(width_) / float(height_);
+  const glm::mat4 inv = glm::inverse(cam_.view_projection(aspect));
+  const float nx = 2.0f * float(px) / float(width_) - 1.0f;
+  // Window y is top-down; the scene's negative-height viewport maps it to GL
+  // clip y, so the same flip applies when unprojecting.
+  const float ny = 1.0f - 2.0f * float(py) / float(height_);
+  glm::vec4 a = inv * glm::vec4(nx, ny, 0.0f, 1.0f);  // near plane
+  glm::vec4 b = inv * glm::vec4(nx, ny, 1.0f, 1.0f);  // far plane
+  const glm::vec3 o = glm::vec3(a) / a.w;
+  return {o, glm::normalize(glm::vec3(b) / b.w - o)};
+}
+
+void App::OnPointerMotion(double x, double y) {
+  last_x_ = cur_x_;
+  last_y_ = cur_y_;
+  cur_x_ = x;
+  cur_y_ = y;
+  if (drag_ == Drag::Orbit) {
+    cam_.angle_y_deg -= float(cur_x_ - last_x_) * 0.4f;
+    cam_.angle_x_deg += float(cur_y_ - last_y_) * 0.4f;
+    cam_.clamp();
+    return;
+  }
+  if (drag_ != Drag::Ball && drag_ != Drag::Drops)
+    return;
+  const auto [o, d] = PixelRay(x, y);
+  if (std::abs(d.y) < 1e-5f)
+    return;
+  if (drag_ == Drag::Ball) {
+    // Slide the ball on its own horizontal plane.
+    const float t = (sphere_pos_.y - o.y) / d.y;
+    if (t > 0.0f) {
+      const glm::vec3 p = o + t * d;
+      const float lim = 1.0f - kSphereR;
+      sphere_pos_.x = glm::clamp(p.x, -lim, lim);
+      sphere_pos_.z = glm::clamp(p.z, -lim, lim);
+    }
+  } else {  // Drag::Drops — paint a trail of drops on the water plane.
+    const float t = -o.y / d.y;
+    if (t > 0.0f) {
+      const glm::vec3 p = o + t * d;
+      if (std::abs(p.x) <= 1.0f && std::abs(p.z) <= 1.0f)
+        pending_drops_.emplace_back(p.x, p.z);
+    }
+  }
+}
+
+void App::OnPointerButton(uint32_t button, uint32_t state) {
+  if (button != BTN_LEFT)
+    return;
+  if (state != WL_POINTER_BUTTON_STATE_PRESSED) {
+    drag_ = Drag::None;
+    return;
+  }
+  const auto [o, d] = PixelRay(cur_x_, cur_y_);
+  const float ts = HitSphere(o, d, sphere_pos_, kSphereR);
+  float tw = -1.0f;
+  glm::vec2 hit{};
+  if (std::abs(d.y) > 1e-5f) {
+    const float t = -o.y / d.y;  // water rest plane y=0
+    if (t > 0.0f) {
+      const glm::vec3 p = o + t * d;
+      if (std::abs(p.x) <= 1.0f && std::abs(p.z) <= 1.0f) {
+        tw = t;
+        hit = {p.x, p.z};
+      }
+    }
+  }
+  if (ts >= 0.0f && (tw < 0.0f || ts < tw))
+    drag_ = Drag::Ball;  // grabbed the ball
+  else if (tw >= 0.0f) {
+    drag_ = Drag::Drops;
+    pending_drops_.push_back(hit);  // splash where clicked
+  } else
+    drag_ = Drag::Orbit;
+}
+
+void App::OnPointerAxis(double value) {
+  cam_.distance += float(value) * 0.05f;  // wheel: dolly the camera
+  cam_.clamp();
+}
+
+void App::OnKey(uint32_t key, uint32_t state) {
+  if (key == KEY_ESC && state == WL_KEYBOARD_KEY_STATE_PRESSED)
+    running_ = false;
+}
+
+void WlPointerHandler::OnMotion(uint32_t, wl_fixed_t sx, wl_fixed_t sy) {
+  if (app_)
+    app_->OnPointerMotion(wl_fixed_to_double(sx), wl_fixed_to_double(sy));
+}
+void WlPointerHandler::OnButton(uint32_t,
+                                uint32_t,
+                                uint32_t button,
+                                uint32_t state) {
+  if (app_)
+    app_->OnPointerButton(button, state);
+}
+void WlPointerHandler::OnAxis(uint32_t, uint32_t axis, wl_fixed_t value) {
+  if (app_ && axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+    app_->OnPointerAxis(wl_fixed_to_double(value));
+}
+void WlPointerHandler::OnLeave(uint32_t, wl_proxy*) {
+  if (app_)
+    app_->OnPointerLeave();
+}
+void WlKeyboardHandler::OnKey(uint32_t,
+                              uint32_t,
+                              uint32_t key,
+                              uint32_t state) {
+  if (app_)
+    app_->OnKey(key, state);
 }
 
 void WlCallbackHandler::OnDone(uint32_t time_ms) {
