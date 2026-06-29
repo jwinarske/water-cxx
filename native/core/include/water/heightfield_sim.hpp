@@ -66,6 +66,12 @@ class HeightfieldSim {
   [[nodiscard]] const Image& current() const noexcept {
     return img_[read_idx_];
   }
+  // The two ping-pong images (0,1). Lets a caller bake one descriptor set per
+  // image and pick the one matching current() each frame, freeing the per-frame
+  // swap count from any parity constraint.
+  [[nodiscard]] const Image& image(uint32_t i) const noexcept {
+    return img_[i];
+  }
 
   // Copy the current heightfield to host memory as RGBA float32 (converts the
   // 16F path). Leaves the image back in SHADER_READ_ONLY_OPTIMAL. Test/debug

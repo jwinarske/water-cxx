@@ -293,7 +293,9 @@ class App {
   water::Mesh plane_{}, pool_mesh_{}, sphere_{};
   VkPipeline pool_pipe_ = VK_NULL_HANDLE, sphere_pipe_ = VK_NULL_HANDLE;
   VkPipeline above_pipe_ = VK_NULL_HANDLE, below_pipe_ = VK_NULL_HANDLE;
-  VkDescriptorSet water_set_ = VK_NULL_HANDLE, surf_ = VK_NULL_HANDLE;
+  // One descriptor set per ping-pong heightfield image (index by current()).
+  VkDescriptorSet water_set_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+  VkDescriptorSet surf_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
   water::OrbitCamera cam_;
   water::ScenePush push_{};
   uint64_t frame_ = 0;
@@ -301,6 +303,7 @@ class App {
   // Interaction state.
   static constexpr float kSphereR = 0.25f;
   glm::vec3 sphere_pos_{-0.4f, -0.75f, 0.2f};
+  glm::vec3 sphere_prev_{-0.4f, -0.75f, 0.2f};  // last frame, for move_sphere
   std::vector<glm::vec2> pending_drops_;  // applied (and cleared) each frame
   Drag drag_ = Drag::None;
   double cur_x_ = 0, cur_y_ = 0, last_x_ = 0, last_y_ = 0;
@@ -695,7 +698,10 @@ bool App::InitEngine() {
   ENG_TRY(plane_, upload_mesh(dev, make_plane(200)));
   ENG_TRY(pool_mesh_, upload_mesh(dev, make_pool()));
   ENG_TRY(sphere_, upload_mesh(dev, make_sphere(32)));
-  ENG_TRY(water_set_, caustics_->make_water_set(sim_->current().view, clamp_));
+  ENG_TRY(water_set_[0],
+          caustics_->make_water_set(sim_->image(0).view, clamp_));
+  ENG_TRY(water_set_[1],
+          caustics_->make_water_set(sim_->image(1).view, clamp_));
 
   const glm::vec3 light = glm::normalize(glm::vec3(2.0f, 2.0f, -1.0f));
   push_.light = glm::vec4(light, 0.0f);
@@ -724,10 +730,12 @@ bool App::CreateSceneResources() {
       return false;
     skybox_.emplace(std::move(*r));
   }
-  ENG_TRY(surf_, scene_->make_surface_set({{{sim_->current().view, clamp_},
-                                            {tiles_.view, repeat_},
-                                            {caustics_->image(0).view, clamp_},
-                                            {sky_.view, clamp_}}}));
+  for (uint32_t i = 0; i < 2; ++i)
+    ENG_TRY(surf_[i],
+            scene_->make_surface_set({{{sim_->image(i).view, clamp_},
+                                       {tiles_.view, repeat_},
+                                       {caustics_->image(0).view, clamp_},
+                                       {sky_.view, clamp_}}}));
 
   auto P = [&](std::span<const uint32_t> v, std::span<const uint32_t> f,
                VkCullModeFlags c) {
@@ -776,27 +784,29 @@ void App::RecordEngine(VkCommandBuffer cmd) {
   // queue.
   FullBarrier(cmd);
 
-  // sim: queued drops (+ zero-strength parity pad so the per-frame ping-pong
-  // swap count stays even, keeping current() at the baked descriptor image),
-  // then 2x step.
+  // sim: the ball displaces the water (move_sphere from last frame's position;
+  // static = its volume held, dragging = a wake), then queued drops, then 2x
+  // step. The swap count no longer needs to be even — we pick the descriptor
+  // set bound to whichever ping-pong image ends up current below.
+  sim_->move_sphere(cmd, sphere_prev_, sphere_pos_, kSphereR);
+  sphere_prev_ = sphere_pos_;
   for (const glm::vec2& d : pending_drops_)
     sim_->add_drop(cmd, d, 0.04f, 0.5f);
-  if (pending_drops_.size() % 2 == 1)
-    sim_->add_drop(cmd, glm::vec2(0.0f), 0.01f, 0.0f);
   pending_drops_.clear();
   sim_->step(cmd);
   sim_->step(cmd);
+  const uint32_t hf = (sim_->current().image == sim_->image(0).image) ? 0u : 1u;
 
   FullBarrier(cmd);  // heightfield writes -> caustics + scene sampling
-  caustics_->render(cmd, 0, push_, plane_, water_set_);
+  caustics_->render(cmd, 0, push_, plane_, water_set_[hf]);
   FullBarrier(cmd);  // caustics output -> scene fragment sampling
 
   scene_->begin(cmd, {0, 0, 0, 1});
   skybox_->record(cmd, glm::inverse(vp), cam_.position());
-  scene_->draw(cmd, pool_pipe_, push_, pool_mesh_, surf_);
-  scene_->draw(cmd, above_pipe_, push_, plane_, surf_);
-  scene_->draw(cmd, below_pipe_, push_, plane_, surf_);
-  scene_->draw(cmd, sphere_pipe_, push_, sphere_, surf_);
+  scene_->draw(cmd, pool_pipe_, push_, pool_mesh_, surf_[hf]);
+  scene_->draw(cmd, above_pipe_, push_, plane_, surf_[hf]);
+  scene_->draw(cmd, below_pipe_, push_, plane_, surf_[hf]);
+  scene_->draw(cmd, sphere_pipe_, push_, sphere_, surf_[hf]);
   scene_->end(cmd);
 
   FullBarrier(
@@ -937,7 +947,7 @@ void App::DestroySceneResources() {
   skybox_.reset();  // its pipeline is built against the scene render pass
   scene_.reset();   // owns the scene pipelines and the surface set's pool
   pool_pipe_ = sphere_pipe_ = above_pipe_ = below_pipe_ = VK_NULL_HANDLE;
-  surf_ = VK_NULL_HANDLE;
+  surf_[0] = surf_[1] = VK_NULL_HANDLE;
 }
 
 // Apply a pending size change: recreate the size-dependent resources at the new
