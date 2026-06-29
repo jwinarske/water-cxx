@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: (c) 2026 Joel Winarske
+# SPDX-License-Identifier: MIT
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    name: build + headless tests (lavapipe)
+    runs-on: ubuntu-24.04   # GCC 13 for C++23 std::expected
+    timeout-minutes: 30
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      WATER_VK_DEVICE: llvmpipe   # select lavapipe (the only device on the runner)
+      WATER_SOAK_STEPS: "30000"   # NaN-soak length, trimmed for CPU rasterization
+    steps:
+      - uses: actions/checkout@v4
+
+      # glslc (with #include support) + spirv-opt/spirv-val + the Vulkan loader and
+      # validation layers come from the LunarG SDK; lavapipe is Mesa's CPU rasterizer.
+      - name: Install Vulkan SDK + lavapipe + build deps
+        run: |
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc > /dev/null
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-noble.list \
+            https://packages.lunarg.com/vulkan/lunarg-vulkan-noble.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            vulkan-sdk mesa-vulkan-drivers libglm-dev cmake ninja-build build-essential
+
+      - name: Vulkan device summary
+        run: vulkaninfo --summary | grep -iE 'deviceName|driverName|apiVersion' || true
+
+      # Spikes are enabled: sp_sim builds and runs on lavapipe; sp_dmabuf is skipped
+      # by CMake when no sibling drm-cxx build is present (its EXISTS guard).
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DWATER_BUILD_NATIVE=ON -DWATER_BUILD_SPIKES=ON
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Headless GPU tests
+        run: ctest --test-dir build --output-on-failure --timeout 900
